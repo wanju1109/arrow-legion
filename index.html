@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>화살 군단 - Arrow Legion</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e1a2b;overflow:hidden;touch-action:none;
+    user-select:none;-webkit-user-select:none;font-family:system-ui,-apple-system,"Segoe UI","Apple SD Gothic Neo","Malgun Gothic",sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;justify-content:center;align-items:center}
+  canvas{display:block;width:100%;height:100%;max-width:calc(100vh * 0.62);touch-action:none;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+(() => {
+'use strict';
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+
+// ---------- Projection ----------
+const CAMD = 6;          // camera distance behind squad (world units)
+const ROAD = 5;          // road half width
+const OFF = 10;          // flattens perspective (more top-down)
+let W = 0, H = 0, DPR = 1, P = 0, camH = 0, Y0 = 0, CX = 0;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  const r = cvs.getBoundingClientRect();
+  W = r.width; H = r.height;
+  cvs.width = Math.round(W * DPR); cvs.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CX = W / 2;
+  P = 0.09 * Math.min(W, H * 0.75) * (CAMD + OFF);
+  Y0 = H * 0.04;
+  camH = (H * 0.78 - Y0) * (CAMD + OFF) / P;
+}
+window.addEventListener('resize', resize);
+
+let camZ = -CAMD;
+function proj(x, z, y = 0) {
+  const d = z - camZ;
+  if (d < 0.3) return null;
+  const k = P / (d + OFF);
+  return { x: CX + x * k, y: Y0 + camH * k - y * k * 0.8, k };
+}
+
+// ---------- Helpers ----------
+const rnd = (a, b) => a + Math.random() * (b - a);
+const ri = (a, b) => Math.floor(rnd(a, b + 1));
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function ell(x, y, rx, ry, color) {
+  ctx.fillStyle = color; ctx.beginPath();
+  ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), 0, 0, Math.PI * 2); ctx.fill();
+}
+function rrect(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function label(text, x, y, size, fill = '#fff', stroke = '#1b2433') {
+  ctx.font = `900 ${size}px system-ui,-apple-system,"Segoe UI",sans-serif`;
+  const mw = ctx.measureText(text).width;
+  if (mw > W * 0.92) size *= (W * 0.92) / mw;
+  ctx.font = `900 ${size}px system-ui,-apple-system,"Segoe UI",sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round'; ctx.lineWidth = Math.max(2, size * 0.18);
+  ctx.strokeStyle = stroke; ctx.strokeText(text, x, y);
+  ctx.fillStyle = fill; ctx.fillText(text, x, y);
+}
+
+// Sunflower layout for squad members
+const UNIT_OFF = [];
+for (let i = 0; i < 200; i++) {
+  const r = 0.36 * Math.sqrt(i), a = i * 2.39996;
+  UNIT_OFF.push({ x: Math.cos(a) * r, z: Math.sin(a) * r * 0.8, i });
+}
+const MAX_DRAW = 90;
+
+// ---------- Game state ----------
+const SPEED = 8;
+const DMG = 0.1;          // damage per soldier per volley
+const FIRE_INT = 0.3;
+let state = 'menu', level = 1, best = 1;
+try { best = +localStorage.getItem('arrowLegionBest') || 1; level = best; } catch (e) {}
+let squad, ents, arrows, parts, texts, playerZ, bossZ, shake = 0, fireT = 0, t = 0, endT = 0;
+
+function squadR() { return 0.36 * Math.sqrt(Math.min(Math.ceil(squad.count), MAX_DRAW)) + 0.3; }
+
+function gateSpec(good) {
+  if (good) {
+    if (Math.random() < 0.25) return { op: 'x', val: (level > 3 && Math.random() < 0.3) ? 3 : 2 };
+    return { op: '+', val: ri(4, 8 + level * 3) };
+  }
+  return { op: '+', val: -ri(4, 8 + level * 4) };
+}
+function addGates(z) {
+  const goodLeft = Math.random() < 0.5, both = Math.random() < 0.25;
+  const L = gateSpec(goodLeft || both), R = gateSpec(!goodLeft || both);
+  const id = Math.random();
+  ents.push({ type: 'gate', x: -2.5, z, w: 4.6, ...L, pair: id, alive: true, flash: 0 });
+  ents.push({ type: 'gate', x: 2.5, z, w: 4.6, ...R, pair: id, alive: true, flash: 0 });
+}
+function addHorde(z) {
+  const full = Math.random() < 0.3;
+  const c = ri(4 + level * 3, 8 + level * 5);
+  ents.push({ type: 'horde', x: full ? 0 : (Math.random() < 0.5 ? -2.5 : 2.5), w: full ? 9.4 : 4.6,
+    z, count: full ? Math.ceil(c * 0.6) : c, alive: true });
+}
+function addBarrels(z) {
+  const xs = Math.random() < 0.5 ? [Math.random() < 0.5 ? -2.5 : 2.5] : [-2.5, 2.5];
+  for (const x of xs) {
+    const hp = ri(8 + level * 4, 16 + level * 6);
+    ents.push({ type: 'barrel', x, z, hp, max: hp, reward: ri(3 + level, 6 + level * 2), alive: true, flash: 0 });
+  }
+}
+
+function buildLevel() {
+  squad = { x: 0, tx: 0, count: 10 };
+  playerZ = 0; camZ = -CAMD; arrows = []; parts = []; texts = []; ents = [];
+  fireT = 0; endT = 0; shake = 0;
+  let z = 28;
+  const len = 240 + level * 40;
+  let last = -1;
+  while (z < len) {
+    let r = Math.random();
+    let kind = z < 30 ? 0 : r < 0.42 ? 0 : r < 0.72 ? 1 : 2;
+    if (kind === last && kind !== 0) kind = 0;
+    if (kind === 0) addGates(z); else if (kind === 1) addHorde(z + 10); else addBarrels(z);
+    last = kind;
+    z += rnd(24, 32);
+  }
+  bossZ = len + 40;
+  const bhp = 300 + level * 250;
+  ents.push({ type: 'boss', x: 0, z: bossZ, hp: bhp, max: bhp, atkT: 0.6, swing: 0, alive: true, flash: 0 });
+}
+
+function startLevel() { buildLevel(); state = 'play'; }
+
+// ---------- Effects ----------
+function burst(x, z, color, n = 12, y = 0.6) {
+  for (let i = 0; i < n; i++) parts.push({ x, z, y, vx: rnd(-3, 3), vz: rnd(-3, 3), vy: rnd(2, 6), life: rnd(0.4, 0.8), color });
+}
+function floatText(x, z, text, color) { texts.push({ x, z, y: 2.2, text, color, life: 1.1 }); }
+
+// ---------- Combat ----------
+function applyGate(g) {
+  const before = squad.count;
+  if (g.op === 'x') squad.count *= g.val; else squad.count += g.val;
+  const diff = Math.round(squad.count - before);
+  floatText(squad.x, playerZ + 1, (diff >= 0 ? '+' : '') + diff, diff >= 0 ? '#7fd0ff' : '#ff7b7b');
+  burst(squad.x, playerZ + 0.5, g.op === 'x' ? '#ffd34d' : (g.val > 0 ? '#5fb2ff' : '#ff5a5a'), 16);
+  if (diff < 0) shake = 0.25;
+}
+
+function fire() {
+  const R = squadR();
+  let target = null, bd = 1e9, hw = 0;
+  for (const e of ents) {
+    if (!e.alive) continue;
+    if (e.type === 'gate' && (e.used || e.op !== '+')) continue;
+    const dz = e.z - playerZ;
+    if (dz < 0.5 || dz > 40) continue;
+    let w;
+    if (e.type === 'gate') { if (Math.abs(e.x - squad.x) > e.w / 2) continue; w = e.w / 2; }
+    else {
+      w = e.type === 'boss' ? 2 : e.type === 'barrel' ? 0.9 : e.w / 2;
+      if (Math.abs(e.x - squad.x) > w + R * 0.5 + 0.3) continue;
+    }
+    if (dz < bd) { bd = dz; target = e; hw = w; }
+  }
+  if (!target) return;
+  const c = Math.ceil(squad.count);
+  const n = Math.min(c, 16);
+  const total = c * DMG;
+  for (let i = 0; i < n; i++) {
+    const o = UNIT_OFF[Math.floor(i * Math.min(c, MAX_DRAW) / n)];
+    arrows.push({
+      sx: squad.x + o.x, sz: playerZ + o.z,
+      tx: target.x + rnd(-hw * 0.6, hw * 0.6), tz: target.z,
+      t: 0, delay: Math.random() * 0.08, dur: 0.12 + bd / 70,
+      target, dmg: total / n, first: i === 0
+    });
+  }
+}
+
+function hit(a) {
+  const e = a.target;
+  if (!e.alive) return;
+  if (e.type === 'gate') {
+    if (a.first && !e.used) { e.val += 1; e.flash = 0.15; }
+  } else if (e.type === 'barrel') {
+    e.hp -= a.dmg; e.flash = 0.1;
+    if (e.hp <= 0) {
+      e.alive = false;
+      squad.count += e.reward;
+      floatText(e.x, e.z, '+' + e.reward, '#7fd0ff');
+      burst(e.x, e.z, '#a8703c', 18, 0.8);
+    }
+  } else if (e.type === 'horde') {
+    e.count -= a.dmg;
+    if (Math.random() < 0.3) burst(a.tx, e.z, '#ff6b6b', 2);
+    if (e.count <= 0) { e.alive = false; burst(e.x, e.z, '#e03b3b', 20); }
+  } else if (e.type === 'boss') {
+    e.hp -= a.dmg; e.flash = 0.08;
+    if (e.hp <= 0) {
+      e.alive = false; shake = 0.6;
+      burst(e.x, e.z, '#ffd34d', 40, 2); burst(e.x, e.z, '#4a4f63', 30, 2);
+      endT = 0.9;
+    }
+  }
+}
+
+function lose() {
+  squad.count = 0; state = 'lose'; shake = 0.4;
+  burst(squad.x, playerZ, '#2f7de1', 25);
+}
+
+// ---------- Update ----------
+const keys = {};
+function update(dt) {
+  t += dt;
+  if (shake > 0) shake = Math.max(0, shake - dt);
+
+  if (state === 'play') {
+    if (keys.left) squad.tx -= 9 * dt;
+    if (keys.right) squad.tx += 9 * dt;
+    squad.tx = clamp(squad.tx, -4.3, 4.3);
+    squad.x += (squad.tx - squad.x) * Math.min(1, dt * 12);
+
+    const boss = ents.find(e => e.type === 'boss' && e.alive);
+    const R = squadR();
+    const spd = (boss && boss.z - playerZ < 16) ? 0 : (boss ? SPEED : 0);
+    playerZ += spd * dt;
+    camZ = playerZ - CAMD;
+
+    for (const e of ents) {
+      if (!e.alive) continue;
+      if (e.flash > 0) e.flash -= dt;
+
+      if (e.type === 'gate' && !e.used && e.z <= playerZ) {
+        const pair = ents.filter(g => g.pair === e.pair);
+        let g = pair[0];
+        for (const p of pair) if (Math.abs(p.x - squad.x) < Math.abs(g.x - squad.x)) g = p;
+        applyGate(g);
+        g.chosen = true;
+        for (const p of pair) p.used = true;
+      } else if (e.type === 'horde') {
+        const dz = e.z - playerZ;
+        const touching = dz < 1.0 && dz > -1.5 && Math.abs(squad.x - e.x) < e.w / 2 + R * 0.6;
+        if (touching) {
+          e.z = Math.max(e.z, playerZ + 0.8);
+          const trade = Math.min(e.count, squad.count, 20 * dt + e.count * 2 * dt);
+          e.count -= trade; squad.count -= trade;
+          if (Math.random() < 0.5) burst(squad.x + rnd(-R, R) * 0.5, playerZ + 0.8, Math.random() < 0.5 ? '#e03b3b' : '#2f7de1', 2);
+          shake = Math.max(shake, 0.12);
+          if (e.count <= 0.001) { e.alive = false; burst(e.x, e.z, '#e03b3b', 14); }
+        } else {
+          e.z -= 2.5 * dt;
+        }
+      } else if (e.type === 'boss') {
+        const dz = e.z - playerZ;
+        if (dz < 16) {
+          if (dz > 2.6) e.z -= 1.6 * dt;
+          else {
+            e.atkT -= dt; e.swing = Math.max(0, e.swing - dt * 3);
+            if (e.atkT <= 0) {
+              e.atkT = 1.0; e.swing = 1;
+              const dmg = 2 + level;
+              squad.count -= dmg; shake = 0.45;
+              floatText(squad.x, playerZ + 1, '-' + dmg, '#ff7b7b');
+              burst(squad.x, playerZ + 0.5, '#2f7de1', 14);
+            }
+          }
+        }
+      }
+      if (e.type !== 'boss' && e.z < camZ + 0.5) e.alive = false;
+    }
+    ents = ents.filter(e => e.alive);
+
+    if (squad.count < 1) lose();
+
+    fireT -= dt;
+    if (fireT <= 0 && state === 'play') { fireT = FIRE_INT; fire(); }
+
+    if (endT > 0) {
+      endT -= dt;
+      if (endT <= 0) {
+        state = 'win';
+        try { best = Math.max(best, level + 1); localStorage.setItem('arrowLegionBest', best); } catch (e) {}
+      }
+    }
+  }
+
+  for (const a of arrows) { a.t += dt; if (!a.done && a.t >= a.delay + a.dur) { a.done = true; hit(a); } }
+  arrows = arrows.filter(a => !a.done);
+  for (const p of parts) { p.life -= dt; p.x += p.vx * dt; p.z += p.vz * dt; p.y += p.vy * dt; p.vy -= 14 * dt; if (p.y < 0) { p.y = 0; p.vy *= -0.3; } }
+  parts = parts.filter(p => p.life > 0);
+  for (const x of texts) { x.life -= dt; x.y += dt * 1.8; }
+  texts = texts.filter(x => x.life > 0);
+}
+
+// ---------- Drawing ----------
+function theme() {
+  return level % 2 === 1
+    ? { side: '#2a78cf', side2: '#4a95e6', road: '#ddd1ba', line: 'rgba(120,100,70,.18)', wall: '#efe6d4', wall2: '#cfc3ab', sky: '#8fc6ff' }
+    : { side: '#e9eff8', side2: '#ffffff', road: '#c3cde2', line: 'rgba(80,95,130,.15)', wall: '#f6f9fd', wall2: '#aab6cc', sky: '#dfe8f6' };
+}
+
+function quad(x1, x2, zn, zf, color) {
+  const a = proj(x1, zn), b = proj(x2, zn), c = proj(x2, zf), d = proj(x1, zf);
+  if (!a || !c) return;
+  ctx.fillStyle = color; ctx.beginPath();
+  ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.closePath(); ctx.fill();
+}
+
+function drawWorld() {
+  const th = theme();
+  ctx.fillStyle = th.side; ctx.fillRect(-20, -20, W + 40, H + 40);
+  const zn = camZ + 0.35, zf = camZ + 140;
+
+  // side decoration (waves or snow mounds) scrolling with z
+  const step = 5, z0 = Math.floor(camZ / step) * step;
+  for (let z = z0 + 120; z > camZ + 0.5; z -= step) {
+    for (const side of [-1, 1]) {
+      const sx = side * (7 + ((z * 7.31) % 5 + 5) % 5);
+      const p = proj(sx, z);
+      if (!p) continue;
+      if (level % 2 === 1) {
+        ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = Math.max(1, p.k * 0.06);
+        ctx.beginPath(); ctx.moveTo(p.x - p.k * 0.6, p.y); ctx.quadraticCurveTo(p.x, p.y - p.k * 0.15, p.x + p.k * 0.6, p.y); ctx.stroke();
+      } else {
+        // pine tree
+        const s = p.k;
+        ctx.fillStyle = '#7a5a3c'; ctx.fillRect(p.x - s * 0.08, p.y - s * 0.4, s * 0.16, s * 0.4);
+        for (let j = 0; j < 3; j++) {
+          ctx.fillStyle = j % 2 ? '#e8f0fa' : '#c9d8ea';
+          ctx.beginPath();
+          const yy = p.y - s * (0.35 + j * 0.45), ww = s * (0.7 - j * 0.18);
+          ctx.moveTo(p.x - ww, yy); ctx.lineTo(p.x + ww, yy); ctx.lineTo(p.x, yy - s * 0.7); ctx.closePath(); ctx.fill();
+        }
+      }
+    }
+  }
+
+  // walls + road
+  quad(-ROAD - 0.9, -ROAD, zn, zf, th.wall2);
+  quad(ROAD, ROAD + 0.9, zn, zf, th.wall2);
+  quad(-ROAD - 0.9, -ROAD - 0.3, zn, zf, th.wall);
+  quad(ROAD + 0.3, ROAD + 0.9, zn, zf, th.wall);
+  quad(-ROAD, ROAD, zn, zf, th.road);
+
+  // tiles
+  ctx.strokeStyle = th.line; ctx.lineWidth = 1;
+  const ts = 2.2, tz0 = Math.ceil((camZ + 0.5) / ts) * ts;
+  for (let z = tz0; z < camZ + 90; z += ts) {
+    const a = proj(-ROAD, z), b = proj(ROAD, z);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    const row = Math.round(z / ts) % 2;
+    for (let x = -ROAD + (row ? 1.1 : 0); x < ROAD; x += 2.2) {
+      const p1 = proj(x, z), p2 = proj(x, z + ts);
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    }
+  }
+  // wall merlons
+  for (let z = Math.ceil(camZ / 3) * 3; z < camZ + 80; z += 3) {
+    for (const s of [-1, 1]) {
+      const a = proj(s * (ROAD + 0.6), z), b = proj(s * (ROAD + 0.6), z + 1.6);
+      if (!a || !b) continue;
+      ctx.fillStyle = th.wall;
+      const w = a.k * 0.6;
+      ctx.beginPath();
+      ctx.moveTo(a.x - w / 2, a.y); ctx.lineTo(a.x + w / 2, a.y);
+      ctx.lineTo(a.x + w / 2, a.y - a.k * 0.5); ctx.lineTo(a.x - w / 2, a.y - a.k * 0.5); ctx.fill();
+      ctx.fillStyle = th.wall2; ctx.fillRect(a.x - w / 2, a.y - a.k * 0.12, w, a.k * 0.12);
+    }
+  }
+
+  // distance fog
+  const g = ctx.createLinearGradient(0, 0, 0, H * 0.22);
+  g.addColorStop(0, th.sky); g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H * 0.22 + 20);
+}
+
+function drawUnit(x, y, s, blue, bob = 0) {
+  y -= bob * s;
+  if (s < 3) { ctx.fillStyle = blue ? '#2f7de1' : '#d93a3a'; ctx.fillRect(x - s * 0.2, y - s * 0.8, s * 0.4, s * 0.8); return; }
+  const body = blue ? '#2f7de1' : '#d93a3a', dark = blue ? '#1d5bb0' : '#a52323', helm = blue ? '#5aa8ff' : '#f05454';
+  ell(x, y + bob * s, 0.28 * s, 0.11 * s, 'rgba(0,0,0,.18)');
+  ell(x, y - 0.3 * s, 0.25 * s, 0.33 * s, dark);
+  ell(x, y - 0.37 * s, 0.21 * s, 0.27 * s, body);
+  if (blue) {
+    // seen from behind: helmet + bow
+    ell(x, y - 0.74 * s, 0.17 * s, 0.17 * s, helm);
+    ell(x - 0.04 * s, y - 0.79 * s, 0.06 * s, 0.05 * s, 'rgba(255,255,255,.5)');
+    ctx.strokeStyle = '#8a5a2b'; ctx.lineWidth = Math.max(1, s * 0.05);
+    ctx.beginPath(); ctx.arc(x + 0.22 * s, y - 0.45 * s, 0.22 * s, -1.3, 1.3); ctx.stroke();
+  } else {
+    // facing the player
+    ell(x, y - 0.72 * s, 0.15 * s, 0.15 * s, '#f2c9a0');
+    ctx.fillStyle = helm; ctx.beginPath(); ctx.arc(x, y - 0.75 * s, 0.17 * s, Math.PI, 0); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x - 0.05 * s, y - 0.9 * s); ctx.lineTo(x + 0.05 * s, y - 0.9 * s); ctx.lineTo(x, y - 1.02 * s); ctx.fill();
+    ell(x - 0.05 * s, y - 0.7 * s, 0.025 * s, 0.03 * s, '#2a1a10');
+    ell(x + 0.05 * s, y - 0.7 * s, 0.025 * s, 0.03 * s, '#2a1a10');
+  }
+}
+
+function drawSquad() {
+  const c = Math.ceil(squad.count);
+  if (c <= 0) return;
+  const n = Math.min(c, MAX_DRAW);
+  const list = UNIT_OFF.slice(0, n).sort((a, b) => b.z - a.z);
+  const moving = state === 'play';
+  for (const o of list) {
+    const p = proj(squad.x + o.x, playerZ + o.z);
+    if (!p) continue;
+    drawUnit(p.x, p.y, p.k, true, moving ? Math.abs(Math.sin(t * 10 + o.i)) * 0.06 : 0);
+  }
+  const R = squadR();
+  const lp = proj(squad.x, playerZ + R * 0.8 + 0.4, 1.6);
+  if (lp) {
+    const txt = String(c), fs = Math.max(16, Math.min(30, lp.k * 0.55));
+    ctx.font = `900 ${fs}px system-ui,sans-serif`;
+    const w = ctx.measureText(txt).width + fs * 0.9;
+    rrect(lp.x - w / 2, lp.y - fs * 0.7, w, fs * 1.4, fs * 0.7);
+    ctx.fillStyle = '#1d5bb0'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+    label(txt, lp.x, lp.y + 1, fs, '#fff', '#123c78');
+  }
+}
+
+function drawGate(e) {
+  const pl = proj(e.x - e.w / 2 + 0.15, e.z), pr = proj(e.x + e.w / 2 - 0.15, e.z);
+  if (!pl) return;
+  const s = pl.k, h = 1.9 * s * 0.85;
+  const col = e.op === 'x' ? '#f4b400' : e.val > 0 ? '#2f86ef' : '#e04646';
+  const colD = e.op === 'x' ? '#c98f00' : e.val > 0 ? '#1d62bd' : '#a92e2e';
+  ctx.save();
+  if (e.used) ctx.globalAlpha = e.chosen ? 0.25 : 0.4;
+  const top = pl.y - h, bot = pl.y - 0.25 * s;
+  // posts
+  ctx.fillStyle = '#8b8f98';
+  ctx.fillRect(pl.x - s * 0.1, top - s * 0.1, s * 0.2, pl.y - top + s * 0.1);
+  ctx.fillRect(pr.x - s * 0.1, top - s * 0.1, s * 0.2, pl.y - top + s * 0.1);
+  // panel
+  ctx.fillStyle = colD; ctx.fillRect(pl.x, top, pr.x - pl.x, bot - top);
+  ctx.fillStyle = col; ctx.fillRect(pl.x + s * 0.06, top + s * 0.06, pr.x - pl.x - s * 0.12, bot - top - s * 0.18);
+  ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(pl.x + s * 0.06, top + s * 0.06, pr.x - pl.x - s * 0.12, (bot - top) * 0.3);
+  if (e.flash > 0) { ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.fillRect(pl.x, top, pr.x - pl.x, bot - top); }
+  const txt = e.op === 'x' ? '×' + e.val : (e.val > 0 ? '+' : '') + e.val;
+  label(txt, (pl.x + pr.x) / 2, (top + bot) / 2, Math.max(8, (bot - top) * 0.6), '#fff', colD);
+  ctx.restore();
+}
+
+function drawBarrel(e) {
+  const p = proj(e.x, e.z);
+  if (!p) return;
+  const s = p.k, w = 1.5 * s, h = 1.3 * s;
+  ell(p.x, p.y, w * 0.55, s * 0.2, 'rgba(0,0,0,.2)');
+  rrect(p.x - w / 2, p.y - h, w, h, s * 0.25);
+  ctx.fillStyle = e.flash > 0 ? '#e0a86d' : '#a8703c'; ctx.fill();
+  ctx.fillStyle = '#6e4626';
+  ctx.fillRect(p.x - w / 2, p.y - h * 0.8, w, s * 0.1);
+  ctx.fillRect(p.x - w / 2, p.y - h * 0.3, w, s * 0.1);
+  ell(p.x, p.y - h, w / 2, s * 0.22, '#c48a52');
+  label(String(Math.ceil(e.hp)), p.x, p.y - h * 0.55, Math.max(8, s * 0.5));
+  // reward: little archers on top
+  const fs = Math.max(8, s * 0.38);
+  drawUnit(p.x - s * 0.25, p.y - h - s * 0.05, s * 0.75, true);
+  drawUnit(p.x + s * 0.25, p.y - h - s * 0.05, s * 0.75, true);
+  label('+' + e.reward, p.x, p.y - h - s * 1.0, fs, '#7fd0ff', '#123c78');
+}
+
+function drawHorde(e) {
+  const c = Math.ceil(e.count);
+  const n = Math.min(c, 60);
+  const cols = Math.max(1, Math.floor(e.w / 0.62));
+  const rows = Math.ceil(n / cols);
+  for (let r = rows - 1; r >= 0; r--) {
+    for (let col = 0; col < cols; col++) {
+      const i = r * cols + col;
+      if (i >= n) continue;
+      const x = e.x - e.w / 2 + 0.31 + col * (e.w - 0.62) / Math.max(1, cols - 1) + (r % 2 ? 0.15 : 0);
+      const p = proj(x, e.z + r * 0.6);
+      if (p) drawUnit(p.x, p.y, p.k, false, Math.abs(Math.sin(t * 9 + i)) * 0.05);
+    }
+  }
+  const lp = proj(e.x, e.z + rows * 0.6, 1.5);
+  if (lp) label(String(c), lp.x, lp.y, Math.max(12, Math.min(28, lp.k * 0.6)), '#fff', '#8a1c1c');
+}
+
+function drawBoss(e) {
+  const p = proj(e.x, e.z);
+  if (!p) return;
+  const s = p.k * 1.25;
+  const bob = Math.sin(t * 3) * 0.05 * s;
+  ell(p.x, p.y, s * 1.4, s * 0.45, 'rgba(0,0,0,.25)');
+  if (e.z - playerZ < 4) {
+    ctx.strokeStyle = 'rgba(230,40,40,.7)'; ctx.lineWidth = Math.max(2, s * 0.06);
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, s * 1.8, s * 0.6, 0, 0, Math.PI * 2); ctx.stroke();
+  }
+  const armor = e.flash > 0 ? '#9aa0b8' : '#4a4f63', armorD = '#2e3242';
+  // legs
+  ctx.fillStyle = armorD;
+  ctx.fillRect(p.x - s * 0.6, p.y - s * 0.9, s * 0.4, s * 0.9);
+  ctx.fillRect(p.x + s * 0.2, p.y - s * 0.9, s * 0.4, s * 0.9);
+  // torso
+  ell(p.x, p.y - s * 1.6 + bob, s * 1.0, s * 0.9, armor);
+  ell(p.x, p.y - s * 1.4 + bob, s * 0.55, s * 0.4, '#8b1e2a');
+  // shoulders with spikes
+  for (const sd of [-1, 1]) {
+    ell(p.x + sd * s * 0.95, p.y - s * 2.1 + bob, s * 0.45, s * 0.38, armorD);
+    ctx.fillStyle = '#c5cad6'; ctx.beginPath();
+    ctx.moveTo(p.x + sd * s * 0.8, p.y - s * 2.4 + bob);
+    ctx.lineTo(p.x + sd * s * 1.15, p.y - s * 3.0 + bob);
+    ctx.lineTo(p.x + sd * s * 1.15, p.y - s * 2.35 + bob); ctx.fill();
+  }
+  // head
+  ell(p.x, p.y - s * 2.6 + bob, s * 0.48, s * 0.5, '#6b7187');
+  ctx.fillStyle = '#111'; ctx.fillRect(p.x - s * 0.35, p.y - s * 2.65 + bob, s * 0.7, s * 0.14);
+  ell(p.x - s * 0.15, p.y - s * 2.58 + bob, s * 0.07, s * 0.04, '#ff3030');
+  ell(p.x + s * 0.15, p.y - s * 2.58 + bob, s * 0.07, s * 0.04, '#ff3030');
+  // mace
+  const ang = -0.6 + e.swing * 1.8;
+  const hx = p.x - s * 1.2, hy = p.y - s * 1.6 + bob;
+  const mx = hx + Math.sin(ang) * s * 1.2 - s * 0.3, my = hy + Math.cos(ang) * s * 1.3;
+  ctx.strokeStyle = '#555'; ctx.lineWidth = Math.max(2, s * 0.08);
+  ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(mx, my); ctx.stroke();
+  ell(mx, my, s * 0.4, s * 0.4, '#2a2d38');
+  ctx.fillStyle = '#9aa0b0';
+  for (let i = 0; i < 6; i++) {
+    const a = i * Math.PI / 3;
+    ctx.beginPath(); ctx.moveTo(mx + Math.cos(a) * s * 0.35, my + Math.sin(a) * s * 0.35);
+    ctx.lineTo(mx + Math.cos(a + 0.2) * s * 0.58, my + Math.sin(a + 0.2) * s * 0.58);
+    ctx.lineTo(mx + Math.cos(a + 0.4) * s * 0.35, my + Math.sin(a + 0.4) * s * 0.35); ctx.fill();
+  }
+  // HP bar
+  const bw = Math.max(90, s * 2.6), bx = p.x - bw / 2, by = p.y - s * 3.5;
+  rrect(bx - 2, by - 2, bw + 4, 14, 6); ctx.fillStyle = '#111'; ctx.fill();
+  rrect(bx, by, Math.max(0, bw * e.hp / e.max), 10, 5); ctx.fillStyle = '#ff4b2b'; ctx.fill();
+  label(String(Math.ceil(e.hp * 10)), p.x, by - 14, Math.max(16, Math.min(32, s * 0.5)));
+}
+
+function drawArrows() {
+  for (const a of arrows) {
+    if (a.t < a.delay) continue;
+    const u = clamp((a.t - a.delay) / a.dur, 0, 1), u0 = Math.max(0, u - 0.12);
+    const pos = q => ({ x: a.sx + (a.tx - a.sx) * q, z: a.sz + (a.tz - a.sz) * q, y: 0.9 + Math.sin(q * Math.PI) * 1.2 });
+    const A = pos(u0), B = pos(u);
+    const pa = proj(A.x, A.z, A.y), pb = proj(B.x, B.z, B.y);
+    if (!pa || !pb) continue;
+    ctx.strokeStyle = 'rgba(255,214,90,.55)'; ctx.lineWidth = Math.max(1.5, pb.k * 0.12);
+    ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+    ctx.strokeStyle = '#fff6c8'; ctx.lineWidth = Math.max(1, pb.k * 0.05);
+    ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+  }
+}
+
+function drawFx() {
+  for (const p of parts) {
+    const q = proj(p.x, p.z, p.y);
+    if (!q) continue;
+    ctx.globalAlpha = clamp(p.life * 2, 0, 1);
+    const sz = Math.max(2, q.k * 0.14);
+    ctx.fillStyle = p.color; ctx.fillRect(q.x - sz / 2, q.y - sz / 2, sz, sz);
+  }
+  ctx.globalAlpha = 1;
+  for (const x of texts) {
+    const q = proj(x.x, x.z, x.y);
+    if (!q) continue;
+    ctx.globalAlpha = clamp(x.life * 1.5, 0, 1);
+    label(x.text, q.x, q.y, Math.max(18, Math.min(40, q.k * 0.8)), x.color, '#14202f');
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  // level + progress
+  const pw = Math.min(W * 0.6, 260), px = (W - pw) / 2, py = 16;
+  rrect(px - 4, py - 4, pw + 8, 18, 9); ctx.fillStyle = 'rgba(15,25,40,.55)'; ctx.fill();
+  const prog = clamp(playerZ / Math.max(1, bossZ - 16), 0, 1);
+  rrect(px, py, Math.max(10, pw * prog), 10, 5); ctx.fillStyle = '#ffd34d'; ctx.fill();
+  label('LEVEL ' + level, W / 2, py + 30, 18);
+}
+
+function overlay(title, sub, sub2) {
+  ctx.fillStyle = 'rgba(8,16,30,.55)'; ctx.fillRect(0, 0, W, H);
+  const fs = Math.min(56, W * 0.13);
+  label(title, W / 2, H * 0.36, fs, '#ffd34d', '#1b2433');
+  if (sub) label(sub, W / 2, H * 0.36 + fs * 1.0, Math.min(18, W * 0.045));
+  if (sub2) label(sub2, W / 2, H * 0.36 + fs * 1.5, Math.min(16, W * 0.04), '#cfe3ff');
+  const pulse = 0.6 + Math.sin(t * 4) * 0.4;
+  ctx.globalAlpha = pulse;
+  label('탭하여 ' + (state === 'menu' ? '시작' : state === 'win' ? '다음 레벨' : '재도전'), W / 2, H * 0.62, Math.min(24, W * 0.06));
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rnd(-1, 1) * shake * 12, rnd(-1, 1) * shake * 12);
+  drawWorld();
+  const list = ents.filter(e => e.alive && e.z - camZ < 95);
+  list.push({ type: 'squad', z: playerZ });
+  list.sort((a, b) => b.z - a.z);
+  for (const e of list) {
+    if (e.type === 'gate') drawGate(e);
+    else if (e.type === 'barrel') drawBarrel(e);
+    else if (e.type === 'horde') drawHorde(e);
+    else if (e.type === 'boss') drawBoss(e);
+    else if (e.type === 'squad') drawSquad();
+  }
+  drawArrows();
+  drawFx();
+  ctx.restore();
+  drawHUD();
+
+  if (state === 'menu') overlay('화살 군단', '드래그로 좌우 이동 · 궁수는 자동 사격', '파란 게이트로 병력을 늘리고, 빨간 게이트는 쏴서 바꾸세요');
+  else if (state === 'win') overlay('승리!', `LEVEL ${level} 클리어`);
+  else if (state === 'lose') overlay('패배', `LEVEL ${level}`, '게이트 선택과 이동을 다시 노려보세요');
+}
+
+// ---------- Input ----------
+let dragging = false, lastX = 0;
+function onTap() {
+  if (state === 'menu') startLevel();
+  else if (state === 'win') { level++; startLevel(); }
+  else if (state === 'lose') startLevel();
+}
+cvs.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (state !== 'play') { onTap(); return; }
+  dragging = true; lastX = e.clientX;
+  try { cvs.setPointerCapture(e.pointerId); } catch (_) {}
+});
+cvs.addEventListener('pointermove', e => {
+  if (!dragging || state !== 'play') return;
+  const dx = e.clientX - lastX; lastX = e.clientX;
+  squad.tx = clamp(squad.tx + dx / (P / (CAMD + OFF)) * 1.3, -4.3, 4.3);
+});
+const endDrag = () => { dragging = false; };
+cvs.addEventListener('pointerup', endDrag);
+cvs.addEventListener('pointercancel', endDrag);
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') keys.left = true;
+  if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.right = true;
+  if ((e.key === ' ' || e.key === 'Enter') && state !== 'play') onTap();
+});
+window.addEventListener('keyup', e => {
+  if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') keys.left = false;
+  if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.right = false;
+});
+
+// debug hook for automated testing (only with #debug)
+if (location.hash === '#debug') window.__g = { get ents() { return ents; }, get squad() { return squad; }, get state() { return state; }, get playerZ() { return playerZ; }, get level() { return level; } };
+
+// ---------- Loop ----------
+resize();
+buildLevel();
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - last) / 1000); last = now;
+  if (W === 0 || H === 0) resize();
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
