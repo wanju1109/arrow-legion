@@ -8,6 +8,8 @@ function fracAt(x, c, test) { const n = Math.min(Math.ceil(c), 90); let k = 0; f
 function outcome(gt, c) { return gt.op === 'x' ? c * gt.val : gt.op === '/' ? Math.ceil(c / gt.val) : c + gt.val; }
 function makeBot(skill) {
   return () => {
+    if (g.state === 'draft') { g.choose(g.choices.findIndex(p => p.id === 'power') >= 0 ? g.choices.findIndex(p => p.id === 'power') : 0); return; }
+    if (g.energy >= 100 && g.ents.some(e => e.alive && ['boss', 'horde', 'brute'].includes(e.type) && e.z - g.playerZ < 25)) g.storm();
     const s = g.squad, pz = g.playerZ, c = s.count;
     const boss = g.ents.find(e => e.type === 'boss' && e.alive);
     if (boss && boss.warn) {
@@ -39,7 +41,7 @@ function runLvl(level, skill) {
   g.start(level);
   const bot = makeBot(skill), c0 = g.save.coins;
   let tt = 0, bossT = null, atBoss = null, prev = g.squad.count, cause = '';
-  while (g.state === 'play' && tt < 300) {
+  while (['play', 'draft'].includes(g.state) && tt < 300) {
     bot(); g.step(1 / 60); tt += 1 / 60;
     if (g.squad.count < prev - 0.5) cause = (g.ents.filter(e => Math.abs(e.z - g.playerZ) < 3 && e.type !== 'gate').map(e => e.type))[0] || 'gate';
     prev = g.squad.count;
@@ -89,7 +91,7 @@ window.study = function (skillName, maxL = 25, reps = 3) {
       g.start(L);
       const c0 = g.save.coins; let tt = 0, bossT = null;
       const bot = window.__mk(SKs[skillName]);
-      while (g.state === 'play' && tt < 300) {
+      while (['play', 'draft'].includes(g.state) && tt < 300) {
         bot(); g.step(1 / 60); tt += 1 / 60;
         const b = g.ents.find(e => e.type === 'boss');
         if (b && bossT === null && b.z - g.playerZ < 16) bossT = tt;

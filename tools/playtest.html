@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>화살 군단 · 로컬 플레이 검증</title>
+<style>
+body{margin:0;padding:20px;background:#071b24;color:#c9e5e2;font:14px system-ui;display:flex;gap:24px;justify-content:center;align-items:flex-start;flex-wrap:wrap}
+iframe{width:390px;height:844px;max-width:100%;border:1px solid #527174;border-radius:16px} aside{width:270px}button{display:block;width:100%;margin:12px 0;padding:14px;border:1px solid #527174;border-radius:10px;background:#183a45;color:#fff;font:inherit;cursor:pointer}pre{white-space:pre-wrap;font:12px monospace;line-height:1.6}
+</style>
+<iframe id="game" title="390 × 844 모바일 게임"></iframe>
+<aside><h2>로컬 플레이 검증</h2><p>개발용 화면입니다. 운영 배포본에서는 테스트하지 않습니다.</p>
+<button id="pause">실시간 진행 / 일시정지</button><button id="step">1초 진행</button><button id="bot">봇으로 다음 전술까지 진행</button><button id="storm">충전된 화살 폭풍 발동</button><button id="run">평균 봇 1~30레벨 검증</button><pre id="result"></pre></aside>
+<aside><h2>보스 패턴 미리보기</h2><button data-pattern="hunt">추적 낙뢰</button><button data-pattern="sweep">3연 횡베기</button><button data-pattern="pincer">포위 사격</button><button data-pattern="wave">교차 충격파</button><p>각 버튼은 새 로컬 테스트 전투를 시작합니다. 일시정지 상태에서 1초씩 진행하거나 실시간 진행으로 전환하세요.</p></aside>
+<script>
+const frame = document.querySelector('#game'), result = document.querySelector('#result');
+if (!['localhost','127.0.0.1','[::1]'].includes(location.hostname)) { document.body.textContent = '로컬 주소에서만 실행할 수 있습니다.'; throw new Error('Local playtest only'); }
+let paused = true;
+frame.onload = () => { frame.contentWindow.__g.paused = true; status(); };
+frame.src = '../index.html#debug';
+function g() { return frame.contentWindow.__g; }
+function status() { result.textContent = JSON.stringify({state:g().state, level:g().level, energy:Math.floor(g().energy), troops:Math.ceil(g().squad.count), tactics:g().tactics},null,2); }
+document.querySelector('#pause').onclick = () => { paused = !paused; g().paused = paused; status(); };
+document.querySelector('#step').onclick = () => { g().step(1); status(); };
+document.querySelector('#storm').onclick = () => { g().storm(); status(); };
+async function bot() { const win = frame.contentWindow; if (!win.__mk) win.eval(await (await fetch('balance-bot.js')).text()); return win.__mk({dodge:0.6,saw:0.6,gate:0.8}); }
+document.querySelector('#bot').onclick = async () => {
+  const move = await bot(); if (g().state === 'menu') g().start(1);
+  if (g().state === 'draft') g().choose(0);
+  for(let i=0;i<12000 && g().state==='play';i++){ move();g().step(1/60); }
+  status();
+};
+document.querySelector('#run').onclick = async () => { await bot(); result.textContent = JSON.stringify(frame.contentWindow.study('avg',30,3),null,2); };
+document.querySelectorAll('[data-pattern]').forEach(button => button.onclick = () => {
+  g().start(1); g().bossPattern(button.dataset.pattern); g().paused = paused = true; status();
+});
+</script></html>
