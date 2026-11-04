@@ -17,6 +17,7 @@ const originalSave = JSON.stringify({ level: 7, best: 9, coins: 123, muted: true
 const storage = new Map([['arrowLegionSave', originalSave], ['arrowLegionTestSave', originalSave]]);
 const sandbox = { Math: math, console, performance: { now: () => 10000 }, location: { hash: '#debug', hostname: '127.0.0.1' }, navigator: {}, document: { getElementById: () => canvas }, localStorage: { getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v) }, requestAnimationFrame: fn => frame = fn };
 sandbox.window = sandbox; sandbox.addEventListener = (name, fn) => events[name] = fn;
+sandbox.Image = class { complete = false; naturalWidth = 0; };
 vm.createContext(sandbox); vm.runInContext(source, sandbox);
 const g = sandbox.__g;
 assert.equal(g.save.coins, 123); assert.equal(g.save.up.power, 3); assert.equal(g.save.best, 9);
@@ -82,3 +83,9 @@ assert.ok(rageBoss.warn.dur < normalDuration); assert.ok(rageBoss.warn.dur >= 0.
 assert.equal(storage.get('arrowLegionSave'), originalSave);
 console.log('PASS four boss patterns, hit sequences, aim lock, safe corridor, rage tempo, production save isolation');
 render();
+// Exercise the actual painted-asset drawing branches as well as loading fallbacks.
+sandbox.Image = class { complete = true; naturalWidth = 1280; naturalHeight = 1280; };
+vm.runInContext(source, sandbox); sandbox.__g.paused = true;
+frame(10000); sandbox.__g.start(1); sandbox.__g.step(1); frame(10000);
+sandbox.__g.bossPattern('sweep'); frame(10000);
+console.log('PASS loaded artwork rendering: menu, units, world and boss');
